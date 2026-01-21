@@ -13,6 +13,9 @@ from tqdm import tqdm
 import time
  
 import torch_scatter
+from plyfile import PlyData, PlyElement
+import os
+
 
 
 def decimate(base_radius, gaussian_model, density_aware=False):
@@ -217,8 +220,43 @@ def load_model(path):
     model.load_ply(path)
     return model
 
-def save_model(path, model):
-    model.save_ply(path)
+def save_model(path, model, meta_source_ply=None):
+    """
+    Save decimated model to `path`.
+    If `meta_source_ply` is provided, copy all non-vertex PLY elements
+    (extrinsic/intrinsic/image_size/frame/disparity/color_space/version, etc.)
+    from meta_source_ply into the output.
+    """
+    if meta_source_ply is None:
+        model.save_ply(path)
+        return
+
+    # 1) Save vertex-only ply to a temp file
+    tmp_path = path + ".tmp_vertex_only.ply"
+    model.save_ply(tmp_path)
+
+    # 2) Read source (ply1) and temp output (ply2 vertex)
+    ply_src = PlyData.read(meta_source_ply)
+    ply_tmp = PlyData.read(tmp_path)
+
+    if "vertex" not in ply_tmp:
+        raise RuntimeError("Temp PLY has no vertex element; cannot merge metadata.")
+
+    # 3) Build new PLY: vertex from tmp + all non-vertex elements from src
+    vertex_el = PlyElement.describe(ply_tmp["vertex"].data, "vertex")
+    other_els = [el for el in ply_src.elements if el.name != "vertex"]
+
+    out = PlyData([vertex_el] + other_els, text=False)
+    out.write(path)
+
+    # 4) Cleanup temp file
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
@@ -265,5 +303,6 @@ if __name__ == "__main__":
 
     #save model
     print("Saving...")
-    save_model(args.save_path, new_gaussian_model)
+    save_model(args.save_path, new_gaussian_model, meta_source_ply=args.path_to_model)
+
     
