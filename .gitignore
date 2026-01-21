@@ -205,3 +205,6 @@ __marimo__/
 # dataset
 output/
 data/
+ply/
+output/
+images/
