@@ -115,6 +115,109 @@ def decimate(base_radius, gaussian_model, density_aware=False):
 
     return gaussian_model
 
+
+def color_smooth_merge(base_radius2, gaussian_model, color_thr=0.005):
+    """
+    Stage B: voxelize with a larger radius, then:
+      - if a voxel bucket is color-smooth -> merge whole bucket into 1 gaussian
+      - else -> keep points unchanged
+
+    color_thr: threshold on max ||c_i - mean_c|| (c is f_dc RGB).
+              Assumes f_dc is roughly in [0,1]. If not, tune accordingly.
+    """
+    device = gaussian_model._xyz.device
+
+    xyz = gaussian_model._xyz                              # (N,3)
+    scaling_act = gaussian_model.get_scaling               # (N,3)  activated
+    rotation = gaussian_model.get_rotation                 # (N,4)  normalized
+    features_dc = gaussian_model._features_dc              # (N,1,3)
+    opacity_act = gaussian_model.get_opacity               # (N,1)  in [0,1]
+
+    N = xyz.shape[0]
+    if N == 0:
+        return gaussian_model
+
+    # --- 1) Bucket assignment by larger voxels ---
+    radii = torch.full((N,), float(base_radius2), device=device)
+    voxel_idx = torch.floor(xyz / radii.unsqueeze(-1)).long()
+    voxel_keys = (voxel_idx * torch.tensor([73856093, 19349663, 83492791], device=device)).sum(1)
+    unique_keys, inverse, counts = torch.unique(voxel_keys, return_inverse=True, return_counts=True)
+    C = unique_keys.shape[0]
+
+    # --- 2) Compute per-bucket color smoothness (max distance to mean color) ---
+    c = features_dc.squeeze(1)  # (N,3)
+    w = opacity_act             # (N,1)
+
+    w_sum = torch_scatter.scatter_sum(w, inverse, dim=0)              # (C,1)
+    c_sum = torch_scatter.scatter_sum(c * w, inverse, dim=0)          # (C,3)
+    mean_c = c_sum / w_sum.clamp_min(1e-12)                           # (C,3)
+
+    d = torch.norm(c - mean_c[inverse], dim=1)                        # (N,)
+    dmax, _ = torch_scatter.scatter_max(d, inverse, dim=0)            # (C,)
+
+    smooth_bucket = (dmax < float(color_thr)) & (counts > 1)          # (C,)
+    smooth_point = smooth_bucket[inverse]                             # (N,)
+
+    num_smooth_buckets = int(smooth_bucket.sum().item())
+    print(f"[Stage B] Buckets: {C}, smooth buckets: {num_smooth_buckets}, kept points: {int((~smooth_point).sum().item())}")
+
+    if num_smooth_buckets == 0:
+        # Nothing to merge
+        return gaussian_model
+
+    # --- 3) Compute merged gaussians for ALL buckets (then select smooth ones) ---
+    mean_xyz = torch_scatter.scatter_mean(xyz, inverse, dim=0)         # (C,3)
+
+    # A lighter scaling rule than the full covariance method:
+    dists = torch.norm(xyz - mean_xyz[inverse], dim=1)
+    max_dists, _ = torch_scatter.scatter_max(dists, inverse, dim=0)    # (C,)
+    mean_scaling = torch_scatter.scatter_mean(scaling_act, inverse, dim=0)  # (C,3)
+    new_scaling_act = torch.maximum(mean_scaling, max_dists.unsqueeze(1) * 0.5)
+
+    # Rotation mean (Markley)
+    rotation = rotation / (torch.norm(rotation, dim=1, keepdim=True) + 1e-12)
+    mean_rot = quaternion_mean_markley(rotation, inverse, C)           # (C,4)
+
+    # Features (opacity-weighted mean)
+    mean_features_dc = torch_scatter.scatter_sum(features_dc * w.unsqueeze(-1), inverse, dim=0) / \
+                       torch_scatter.scatter_sum(w.unsqueeze(-1), inverse, dim=0).clamp_min(1e-12)
+
+    # Opacity fusion
+    one_minus_alpha = 1 - opacity_act.squeeze(1)                       # (N,)
+    prod = torch_scatter.scatter_mul(one_minus_alpha, inverse, dim=0)  # (C,)
+    new_opacity_act = (1 - prod).unsqueeze(1)                          # (C,1)
+
+    # --- 4) Select smooth buckets to keep as merged points ---
+    sel = smooth_bucket
+    merged_xyz = mean_xyz[sel]
+    merged_scaling_param = gaussian_model.scaling_inverse_activation(new_scaling_act[sel])
+    merged_rot = mean_rot[sel]
+    merged_dc = mean_features_dc[sel]
+    merged_opacity_param = gaussian_model.inverse_opacity_activation(new_opacity_act[sel].clamp(1e-6, 1-1e-6))
+
+    # --- 5) Keep non-smooth points unchanged (use existing params to avoid drift) ---
+    keep = ~smooth_point
+
+    xyz_out = torch.cat([gaussian_model._xyz[keep], merged_xyz], dim=0)
+    scaling_out = torch.cat([gaussian_model._scaling[keep], merged_scaling_param], dim=0)
+    rotation_out = torch.cat([gaussian_model._rotation[keep], merged_rot], dim=0)
+    dc_out = torch.cat([gaussian_model._features_dc[keep], merged_dc], dim=0)
+    opacity_out = torch.cat([gaussian_model._opacity[keep], merged_opacity_param], dim=0)
+
+    gaussian_model._xyz = xyz_out
+    gaussian_model._scaling = scaling_out
+    gaussian_model._rotation = rotation_out
+    gaussian_model._features_dc = dc_out
+    gaussian_model._opacity = opacity_out
+
+    # For SH degree 0, keep an empty rest tensor with correct first dimension
+    if gaussian_model.max_sh_degree == 0:
+        gaussian_model._features_rest = torch.empty((xyz_out.shape[0], 0, 3), device=device, dtype=dc_out.dtype)
+
+    return gaussian_model
+
+
+
 def quaternion_mean_markley(quats, cluster_ids, num_clusters, chunk: int = 20000):
     """
     Vectorized Markley quaternion averaging.
@@ -300,6 +403,7 @@ if __name__ == "__main__":
     decimate(float(args.decimate_radius), new_gaussian_model, False)
     #progressive_decimate(new_gaussian_model, 1000)
     print("--- %s seconds ---" % (time.time() - start_time))
+    color_smooth_merge(float(args.decimate_radius) * 10, new_gaussian_model, color_thr=0.005)
 
     #save model
     print("Saving...")
